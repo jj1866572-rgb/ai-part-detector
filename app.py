@@ -10,10 +10,10 @@ import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageFilter
 from pydantic import BaseModel
 
-app = FastAPI(title="Pro Subject & FASHN B4 Clothes Segmenter")
+app = FastAPI(title="Fast Pro Subject & FASHN B4 Segmenter")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,8 +26,6 @@ BASE_DIR = Path(__file__).resolve().parent
 LOCAL_MODELS_DIR = BASE_DIR / "models"
 TMP_MODELS_DIR = Path("/tmp/models")
 
-# 1. ORMBG (IS-Net 1024px) -> নিখুঁত Subject / Background কাটআউট
-# 2. FASHN Human Parser (SegFormer-B4) -> নিখুঁত Shirt/Top, Arms+Hands, Pants, Shoes, Hair, Face
 SUBJECT_MODEL_URL = "https://huggingface.co/onnx-community/ormbg-ONNX/resolve/main/onnx/model_quantized.onnx"
 FASHN_MODEL_URL = "https://huggingface.co/faisal-shohag/fashn-human-parser-onnx/resolve/main/onnx/model_quantized.onnx"
 
@@ -96,7 +94,6 @@ def get_sessions():
                 _subject_sess = ort.InferenceSession(subj_path, sess_options=opts, providers=["CPUExecutionProvider"])
                 _fashn_sess = ort.InferenceSession(fashn_path, sess_options=opts, providers=["CPUExecutionProvider"])
             except Exception:
-                # করাপ্টেড ক্যাশ থাকলে পরিষ্কার করে পুনরায় ডাউনলোড
                 for p in (subj_path, fashn_path):
                     if p.startswith("/tmp/") and os.path.exists(p):
                         os.remove(p)
@@ -105,7 +102,7 @@ def get_sessions():
     return _subject_sess, _fashn_sess
 
 
-def preprocess_ormbg(pil_img: Image.Image, size: int = 1024) -> np.ndarray:
+def preprocess_ormbg(pil_img: Image.Image, size: int) -> np.ndarray:
     resized = pil_img.resize((size, size), Image.Resampling.BILINEAR)
     arr = np.asarray(resized, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))
@@ -113,7 +110,6 @@ def preprocess_ormbg(pil_img: Image.Image, size: int = 1024) -> np.ndarray:
 
 
 def preprocess_fashn(pil_img: Image.Image) -> np.ndarray:
-    # FASHN Human Parser (SegFormer-B4) ইনপুট সাইজ: 384 (W) x 576 (H)
     resized = pil_img.resize((384, 576), Image.Resampling.BILINEAR)
     arr = np.asarray(resized, dtype=np.float32) / 255.0
     arr = (arr - MEAN) / STD
@@ -123,10 +119,13 @@ def preprocess_fashn(pil_img: Image.Image) -> np.ndarray:
 
 def run_subject_ormbg(subject_sess: ort.InferenceSession, orig_img: Image.Image) -> np.ndarray:
     orig_w, orig_h = orig_img.size
-    inp_name = subject_sess.get_inputs()[0].name
-    inp = preprocess_ormbg(orig_img, 1024)
+    inp_meta = subject_sess.get_inputs()[0]
+    inp_shape = inp_meta.shape
+    # ডাইনামিক শেপ হলে 640px ব্যবহার করে ২.৫ গুণ দ্রুত প্রসেসিং
+    subj_size = 640 if (len(inp_shape) >= 4 and not isinstance(inp_shape[2], int)) else int(inp_shape[2])
 
-    raw = subject_sess.run(None, {inp_name: inp})[0]
+    inp = preprocess_ormbg(orig_img, subj_size)
+    raw = subject_sess.run(None, {inp_meta.name: inp})[0]
     pred = np.squeeze(raw).astype(np.float32)
     if pred.ndim == 3:
         pred = pred[0]
@@ -139,7 +138,8 @@ def run_subject_ormbg(subject_sess: ort.InferenceSession, orig_img: Image.Image)
 
     pred_img = Image.fromarray(pred, mode="F").resize((orig_w, orig_h), Image.Resampling.BILINEAR)
     alpha = np.asarray(pred_img, dtype=np.float32)
-    alpha = np.clip((alpha - 0.06) / (0.94 - 0.06), 0.0, 1.0)
+    # হালকা হ্যাজ ও ব্লার বাদ দিয়ে ক্রিস্প সাবজেক্ট এজ
+    alpha = np.clip((alpha - 0.14) / (0.86 - 0.14), 0.0, 1.0)
     return (alpha * 255.0).astype(np.uint8)
 
 
@@ -159,8 +159,20 @@ def run_fashn_b4(fashn_sess: ort.InferenceSession, orig_img: Image.Image) -> np.
     orig_w, orig_h = orig_img.size
     inp_name = fashn_sess.get_inputs()[0].name
     inp = preprocess_fashn(orig_img)
-    logits = fashn_sess.run(None, {inp_name: inp})[0][0]  # (18, 144, 96)
+    logits = fashn_sess.run(None, {inp_name: inp})[0][0]
     return logits_to_upsampled_probs(logits, orig_w, orig_h)
+
+
+def clean_part_mask(mask_u8: np.ndarray) -> np.ndarray:
+    """
+    Hair ও Face থেকে খুচরো নয়েজ বিন্দু ও ছোট ছিদ্র পরিষ্কার করে ক্রিস্প এজ তৈরি করে।
+    """
+    img = Image.fromarray(mask_u8, mode="L")
+    img = img.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    img = img.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    arr = np.clip((arr - 0.25) / (0.75 - 0.25), 0.0, 1.0)
+    return (arr * 255.0).astype(np.uint8)
 
 
 def mask_u8_to_base64_rgba(mask_u8: np.ndarray) -> str:
@@ -172,7 +184,7 @@ def mask_u8_to_base64_rgba(mask_u8: np.ndarray) -> str:
     rgba[..., 3] = mask_u8
 
     buf = io.BytesIO()
-    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", compress_level=3)
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", compress_level=1)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
@@ -181,7 +193,7 @@ def mask_u8_to_base64_rgba(mask_u8: np.ndarray) -> str:
 def health():
     return {
         "status": "ok",
-        "models": ["ORMBG (Subject)", "FASHN SegFormer-B4 (Clothes & Parts)"],
+        "models": ["ORMBG (Fast Crisp Subject)", "FASHN SegFormer-B4 (Clothes & Parts)"],
     }
 
 
@@ -191,7 +203,7 @@ def warmup():
         get_sessions()
         return {
             "ready": True,
-            "models": ["ORMBG (Subject)", "FASHN SegFormer-B4 (Clothes & Parts)"],
+            "models": ["ORMBG (Fast Crisp Subject)", "FASHN SegFormer-B4 (Clothes & Parts)"],
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model warmup failed: {e}")
@@ -208,14 +220,8 @@ def segment_parts(req: SegmentRequest):
 
     try:
         subject_sess, fashn_sess = get_sessions()
-
-        # 1. Subject & Background
         subject_u8 = run_subject_ormbg(subject_sess, orig_img)
         bg_u8 = (255 - subject_u8).astype(np.uint8)
-
-        # 2. FASHN SegFormer-B4 (18 classes)
-        # 0:bg, 1:face, 2:hair, 3:top, 4:dress, 5:skirt, 6:pants, 7:belt, 8:bag,
-        # 9:hat, 10:scarf, 11:glasses, 12:arms, 13:hands, 14:legs, 15:feet, 16:torso, 17:jewelry
         f_probs = run_fashn_b4(fashn_sess, orig_img)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {e}")
@@ -243,6 +249,7 @@ def segment_parts(req: SegmentRequest):
 
         part_u8 = np.clip(p_sum * 255.0, 0, 255).astype(np.uint8)
         part_u8 = np.minimum(part_u8, subject_gate)
+        part_u8 = clean_part_mask(part_u8)
         parts.append({
             "label": label,
             "mask": mask_u8_to_base64_rgba(part_u8),
@@ -253,7 +260,6 @@ def segment_parts(req: SegmentRequest):
 
     add_smart_part("Shirt / Top", [3], min_ratio=0.025, min_abs=350)
 
-    # টি-শার্টের ওপর ছোটখাটো Dress নয়েজ এড়াতে স্মার্ট ফিল্টার
     if not (top_cnt > dress_cnt * 2.2 and dress_cnt < subj_area * 0.08):
         add_smart_part("Dress", [4], min_ratio=0.04, min_abs=500)
 
