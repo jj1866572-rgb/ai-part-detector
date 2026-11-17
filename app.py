@@ -110,12 +110,27 @@ def preprocess_ormbg(pil_img: Image.Image, size: int) -> np.ndarray:
     return np.ascontiguousarray(arr[None, ...], dtype=np.float32)
 
 
-def preprocess_fashn(pil_img: Image.Image) -> np.ndarray:
-    resized = pil_img.resize((384, 576), Image.Resampling.BILINEAR)
-    arr = np.asarray(resized, dtype=np.float32) / 255.0
+def preprocess_fashn_letterbox(pil_img: Image.Image, tw: int = 384, th: int = 576):
+    """
+    ছবিকে চ্যাপ্টা না করে অনুপাত ঠিক রেখে (Letterbox Pad) FASHN-এ দেয়—
+    ফলে মুখ ও দুই কান একদম নিখুঁত থাকে।
+    """
+    ow, oh = pil_img.size
+    scale = min(tw / float(ow), th / float(oh))
+    nw = max(16, int(round(ow * scale)))
+    nh = max(16, int(round(oh * scale)))
+    pad_x = (tw - nw) // 2
+    pad_y = (th - nh) // 2
+
+    canvas = Image.new("RGB", (tw, th), (128, 128, 128))
+    resized = pil_img.resize((nw, nh), Image.Resampling.BILINEAR)
+    canvas.paste(resized, (pad_x, pad_y))
+
+    arr = np.asarray(canvas, dtype=np.float32) / 255.0
     arr = (arr - MEAN) / STD
     arr = np.transpose(arr, (2, 0, 1))
-    return np.ascontiguousarray(arr[None, ...], dtype=np.float32)
+    tensor = np.ascontiguousarray(arr[None, ...], dtype=np.float32)
+    return tensor, (pad_x, pad_y, nw, nh, tw, th)
 
 
 def run_subject_ormbg(subject_sess: ort.InferenceSession, orig_img: Image.Image) -> np.ndarray:
@@ -142,11 +157,23 @@ def run_subject_ormbg(subject_sess: ort.InferenceSession, orig_img: Image.Image)
     return (alpha * 255.0).astype(np.uint8)
 
 
-def logits_to_upsampled_probs(logits: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
-    c = logits.shape[0]
+def logits_to_upsampled_probs(logits: np.ndarray, target_w: int, target_h: int, box_info=None) -> np.ndarray:
+    c, lh, lw = logits.shape
+    if box_info is not None:
+        pad_x, pad_y, nw, nh, tw, th = box_info
+        bx1 = pad_x * (lw / float(tw))
+        by1 = pad_y * (lh / float(th))
+        bx2 = (pad_x + nw) * (lw / float(tw))
+        by2 = (pad_y + nh) * (lh / float(th))
+        crop_box = (bx1, by1, bx2, by2)
+    else:
+        crop_box = None
+
     up = np.empty((c, target_h, target_w), dtype=np.float32)
     for i in range(c):
-        ch_img = Image.fromarray(logits[i], mode="F").resize((target_w, target_h), Image.Resampling.BILINEAR)
+        ch_img = Image.fromarray(logits[i], mode="F").resize(
+            (target_w, target_h), Image.Resampling.BILINEAR, box=crop_box
+        )
         up[i] = np.asarray(ch_img, dtype=np.float32)
 
     shifted = up - np.max(up, axis=0, keepdims=True)
@@ -157,15 +184,12 @@ def logits_to_upsampled_probs(logits: np.ndarray, target_w: int, target_h: int) 
 def run_fashn_b4(fashn_sess: ort.InferenceSession, orig_img: Image.Image) -> np.ndarray:
     orig_w, orig_h = orig_img.size
     inp_name = fashn_sess.get_inputs()[0].name
-    inp = preprocess_fashn(orig_img)
+    inp, box_info = preprocess_fashn_letterbox(orig_img, 384, 576)
     logits = fashn_sess.run(None, {inp_name: inp})[0][0]
-    return logits_to_upsampled_probs(logits, orig_w, orig_h)
+    return logits_to_upsampled_probs(logits, orig_w, orig_h, box_info=box_info)
 
 
 def remove_small_islands(mask_u8: np.ndarray, min_ratio: float = 0.05, min_abs: int = 18) -> np.ndarray:
-    """
-    Hair, Face, Face Mask ইত্যাদি থেকে ছোট ছোট বিচ্ছিন্ন পয়েন্ট/বিন্দু সম্পূর্ণ মুছে ফেলে।
-    """
     h, w = mask_u8.shape
     grid = 128
     small = np.asarray(Image.fromarray(mask_u8, mode="L").resize((grid, grid), Image.Resampling.BILINEAR), dtype=np.uint8)
@@ -211,20 +235,22 @@ def remove_small_islands(mask_u8: np.ndarray, min_ratio: float = 0.05, min_abs: 
     return np.where(keep_full >= 90, mask_u8, 0).astype(np.uint8)
 
 
-def clean_part_mask(mask_u8: np.ndarray, island_ratio: float = 0.05) -> np.ndarray:
+def clean_part_mask(mask_u8: np.ndarray, island_ratio: float = 0.05, erode: bool = True, close_size: int = 3) -> np.ndarray:
     img = Image.fromarray(mask_u8, mode="L")
-    img = img.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
-    img = img.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    # ছোট ছিদ্র বন্ধ করা (Closing)
+    img = img.filter(ImageFilter.MaxFilter(close_size)).filter(ImageFilter.MinFilter(close_size))
+    if erode:
+        # বাইরের খুচরো বিন্দু মোছা (Opening)
+        img = img.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = np.clip((arr - 0.25) / (0.75 - 0.25), 0.0, 1.0)
     cleaned = (arr * 255.0).astype(np.uint8)
-    return remove_small_islands(cleaned, min_ratio=island_ratio, min_abs=14)
+    return remove_small_islands(cleaned, min_ratio=island_ratio, min_abs=12)
 
 
-def detect_face_mask(subject_u8: np.ndarray, winning_cls: np.ndarray) -> np.ndarray | None:
+def detect_face_mask(subject_u8: np.ndarray, winning_cls: np.ndarray, f_probs: np.ndarray) -> np.ndarray | None:
     """
-    মুখে মাস্ক পরা থাকলে Face (eyes/forehead) এবং Neck/Top-এর মাঝখানে ORMBG Subject-এর
-    ভেতরের অংশ থেকে নিখুঁত Face Mask আলাদা করে।
+    মুখের প্রস্থ (fw) অনুযায়ী চিবুক ও নাক-মুখ বরাবর ORMBG Subject-এর ভেতরের মাস্ক নিখুঁতভাবে বের করে।
     """
     h, w = subject_u8.shape
     face_ys, face_xs = np.where((winning_cls == 1) & (subject_u8 >= 90))
@@ -237,27 +263,33 @@ def detect_face_mask(subject_u8: np.ndarray, winning_cls: np.ndarray) -> np.ndar
     fh = max(1, fy2 - fy1)
     face_area = len(face_xs)
 
-    roi_x1 = max(0, fx1 - int(fw * 0.12))
-    roi_x2 = min(w, fx2 + int(fw * 0.12))
-    roi_y1 = max(0, fy1 + int(fh * 0.18))
-    roi_y2 = min(h, fy2 + int(fh * 1.15))
+    roi_x1 = max(0, fx1 - int(fw * 0.08))
+    roi_x2 = min(w, fx2 + int(fw * 0.08))
+    roi_y1 = max(0, fy1 + int(fh * 0.25))
+    # মাস্ক পরা থাকলে fh ছোট হয়ে যায়, তাই fw দিয়ে পুরো চিবুক পর্যন্ত কভার করা
+    roi_y2 = min(h, fy2 + max(int(fh * 1.45), int(fw * 0.95)))
 
     roi_mask = np.zeros((h, w), dtype=bool)
     roi_mask[roi_y1:roi_y2, roi_x1:roi_x2] = True
 
-    # মুখের মাস্ক: Subject-এর ভেতরে আছে, কিন্তু Face(1), Top(3), Arms(12,13), Torso/Neck(16) নয়
-    non_mask_cls = np.isin(winning_cls, [1, 3, 12, 13, 16])
-    cand = roi_mask & (subject_u8 >= 120) & (~non_mask_cls)
+    # যেসব অংশ স্পষ্টভাবে চামড়া, চুল, জামা, হাত বা গলা নয় অথচ Subject-এর ভেতরে আছে
+    is_other_part = (
+        (f_probs[1] >= 0.45)
+        | (f_probs[2] >= 0.48)
+        | (f_probs[3] >= 0.48)
+        | (f_probs[12] >= 0.45)
+        | (f_probs[13] >= 0.45)
+        | (f_probs[16] >= 0.46)
+    )
+    cand = roi_mask & (subject_u8 >= 120) & (~is_other_part)
     cand_u8 = (cand.astype(np.uint8)) * 255
 
-    # শুধু মূল বড় মাস্কটি রাখা (১টি বৃহত্তম আইল্যান্ড)
-    cleaned = remove_small_islands(cand_u8, min_ratio=0.45, min_abs=20)
-    cleaned = clean_part_mask(cleaned, island_ratio=0.45)
+    cleaned = clean_part_mask(cand_u8, island_ratio=0.45, erode=False, close_size=5)
 
     my, mx = np.where(cleaned >= 120)
-    if len(mx) < max(250, int(face_area * 0.25)):
+    if len(mx) < max(220, int(face_area * 0.22)):
         return None
-    if (int(mx.max()) - int(mx.min())) < fw * 0.35:
+    if (int(mx.max()) - int(mx.min())) < fw * 0.32:
         return None
     return cleaned
 
@@ -280,7 +312,7 @@ def mask_u8_to_base64_rgba(mask_u8: np.ndarray) -> str:
 def health():
     return {
         "status": "ok",
-        "models": ["ORMBG (Fast Crisp Subject)", "FASHN SegFormer-B4 (Clothes, Face & Face Mask)"],
+        "models": ["ORMBG (Fast Crisp Subject)", "FASHN SegFormer-B4 (Clothes, Face+Ears & Face Mask)"],
     }
 
 
@@ -290,7 +322,7 @@ def warmup():
         get_sessions()
         return {
             "ready": True,
-            "models": ["ORMBG (Fast Crisp Subject)", "FASHN SegFormer-B4 (Clothes, Face & Face Mask)"],
+            "models": ["ORMBG (Fast Crisp Subject)", "FASHN SegFormer-B4 (Clothes, Face+Ears & Face Mask)"],
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model warmup failed: {e}")
@@ -321,11 +353,19 @@ def segment_parts(req: SegmentRequest):
     top_cnt = int(np.count_nonzero((winning_cls == 3) & subject_valid))
     dress_cnt = int(np.count_nonzero((winning_cls == 4) & subject_valid))
 
-    face_mask_u8 = detect_face_mask(subject_u8, winning_cls)
+    face_mask_u8 = detect_face_mask(subject_u8, winning_cls, f_probs)
 
     parts = []
 
-    def add_smart_part(label: str, class_ids: list[int], min_ratio: float, min_abs: int, min_conf: float = 0.45, island_ratio: float = 0.05):
+    def add_smart_part(
+        label: str,
+        class_ids: list[int],
+        min_ratio: float,
+        min_abs: int,
+        min_conf: float = 0.45,
+        island_ratio: float = 0.05,
+        erode: bool = True,
+    ):
         win_mask = np.isin(winning_cls, class_ids) & subject_valid
         win_cnt = int(np.count_nonzero(win_mask))
         req_pixels = max(min_abs, int(subj_area * min_ratio))
@@ -340,7 +380,7 @@ def segment_parts(req: SegmentRequest):
         part_u8 = np.minimum(part_u8, subject_gate)
         if face_mask_u8 is not None and label in ("Hair", "Face"):
             part_u8 = np.minimum(part_u8, (255 - face_mask_u8).astype(np.uint8))
-        part_u8 = clean_part_mask(part_u8, island_ratio=island_ratio)
+        part_u8 = clean_part_mask(part_u8, island_ratio=island_ratio, erode=erode)
         if int(np.count_nonzero(part_u8 >= 120)) < min_abs // 2:
             return
         parts.append({
@@ -360,7 +400,9 @@ def segment_parts(req: SegmentRequest):
     add_smart_part("Skirt", [5], min_ratio=0.025, min_abs=350)
     add_smart_part("Shoes", [15], min_ratio=0.008, min_abs=140, island_ratio=0.12)
     add_smart_part("Hair", [2], min_ratio=0.012, min_abs=180, island_ratio=0.08)
-    add_smart_part("Face", [1], min_ratio=0.012, min_abs=180, island_ratio=0.10)
+
+    # Face: erode=False ও island_ratio=0.025 রাখায় দুই কান পুরোপুরি সিলেক্ট হবে এবং ছোট দাগ থাকবে না
+    add_smart_part("Face", [1], min_ratio=0.012, min_abs=180, island_ratio=0.025, erode=False)
 
     if face_mask_u8 is not None:
         parts.append({"label": "Face Mask", "mask": mask_u8_to_base64_rgba(face_mask_u8)})
