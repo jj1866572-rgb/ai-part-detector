@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageFilter
 from pydantic import BaseModel
 
-app = FastAPI(title="Smart Pro Subject, Clothes, Objects & Mask Segmenter")
+app = FastAPI(title="Fast Pro Subject, Clothes, Bag & Mask Segmenter")
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,7 +134,8 @@ def run_subject_ormbg(subject_sess: ort.InferenceSession, orig_img: Image.Image)
     orig_w, orig_h = orig_img.size
     inp_meta = subject_sess.get_inputs()[0]
     inp_shape = inp_meta.shape
-    subj_size = 640 if (len(inp_shape) >= 4 and not isinstance(inp_shape[2], int)) else int(inp_shape[2])
+    # 512px ডাইনামিক ইনপুটে ৬৪০px-এর চেয়ে ~৪০% দ্রুত রান হয় এবং শার্প থাকে
+    subj_size = 512 if (len(inp_shape) >= 4 and not isinstance(inp_shape[2], int)) else int(inp_shape[2])
 
     inp = preprocess_ormbg(orig_img, subj_size)
     raw = subject_sess.run(None, {inp_meta.name: inp})[0]
@@ -154,40 +155,41 @@ def run_subject_ormbg(subject_sess: ort.InferenceSession, orig_img: Image.Image)
     return (alpha * 255.0).astype(np.uint8)
 
 
-def logits_to_upsampled_probs(logits: np.ndarray, target_w: int, target_h: int, box_info=None) -> np.ndarray:
-    c, lh, lw = logits.shape
-    if box_info is not None:
-        pad_x, pad_y, nw, nh, tw, th = box_info
-        crop_box = (
-            pad_x * (lw / float(tw)),
-            pad_y * (lh / float(th)),
-            (pad_x + nw) * (lw / float(tw)),
-            (pad_y + nh) * (lh / float(th)),
-        )
-    else:
-        crop_box = None
-
-    up = np.empty((c, target_h, target_w), dtype=np.float32)
-    for i in range(c):
-        ch_img = Image.fromarray(logits[i], mode="F").resize(
-            (target_w, target_h), Image.Resampling.BILINEAR, box=crop_box
-        )
-        up[i] = np.asarray(ch_img, dtype=np.float32)
-
-    shifted = up - np.max(up, axis=0, keepdims=True)
-    exp = np.exp(shifted)
-    return exp / np.sum(exp, axis=0, keepdims=True)
-
-
-def run_fashn_b4(fashn_sess: ort.InferenceSession, orig_img: Image.Image) -> np.ndarray:
+def run_fashn_b4_fast(fashn_sess: ort.InferenceSession, orig_img: Image.Image) -> np.ndarray:
+    """
+    আগে ছোট 144x96 সাইজেই Softmax সেরে শুধু সক্রিয় ক্লাসগুলো Upsample করে—
+    এতে মেমরি ও প্রসেসিং সময় অনেক কমে যায়।
+    """
     orig_w, orig_h = orig_img.size
     inp_name = fashn_sess.get_inputs()[0].name
     inp, box_info = preprocess_fashn_letterbox(orig_img, 384, 576)
-    logits = fashn_sess.run(None, {inp_name: inp})[0][0]
-    return logits_to_upsampled_probs(logits, orig_w, orig_h, box_info=box_info)
+    logits = fashn_sess.run(None, {inp_name: inp})[0][0]  # (18, 144, 96)
+
+    shifted = logits - np.max(logits, axis=0, keepdims=True)
+    exp_l = np.exp(shifted)
+    probs_small = exp_l / np.sum(exp_l, axis=0, keepdims=True)
+
+    c, lh, lw = probs_small.shape
+    pad_x, pad_y, nw, nh, tw, th = box_info
+    crop_box = (
+        pad_x * (lw / float(tw)),
+        pad_y * (lh / float(th)),
+        (pad_x + nw) * (lw / float(tw)),
+        (pad_y + nh) * (lh / float(th)),
+    )
+
+    up = np.zeros((c, orig_h, orig_w), dtype=np.float32)
+    for i in range(c):
+        # 0(bg), 1(face), 2(hair), 3(top) সবসময় রাখি; বাকিগুলোর মধ্যে শুধু সক্রিয় ক্লাস Upsample করি
+        if i <= 3 or float(probs_small[i].max()) >= 0.20:
+            ch_img = Image.fromarray(probs_small[i], mode="F").resize(
+                (orig_w, orig_h), Image.Resampling.BILINEAR, box=crop_box
+            )
+            up[i] = np.asarray(ch_img, dtype=np.float32)
+    return up
 
 
-def find_connected_components(mask_u8: np.ndarray, grid: int = 160):
+def find_connected_components(mask_u8: np.ndarray, grid: int = 144):
     small = np.asarray(Image.fromarray(mask_u8, mode="L").resize((grid, grid), Image.Resampling.BILINEAR), dtype=np.uint8)
     fg = (small >= 110).ravel().tolist()
     n = grid * grid
@@ -223,7 +225,7 @@ def find_connected_components(mask_u8: np.ndarray, grid: int = 160):
     return grid, comp_id, comp_sizes
 
 
-def remove_small_islands(mask_u8: np.ndarray, min_ratio: float = 0.05, min_abs: int = 16, grid: int = 144) -> np.ndarray:
+def remove_small_islands(mask_u8: np.ndarray, min_ratio: float = 0.05, min_abs: int = 14, grid: int = 144) -> np.ndarray:
     h, w = mask_u8.shape
     g, comp_id, comp_sizes = find_connected_components(mask_u8, grid=grid)
     if len(comp_sizes) <= 1:
@@ -239,7 +241,7 @@ def remove_small_islands(mask_u8: np.ndarray, min_ratio: float = 0.05, min_abs: 
 
 def extract_top_component_masks(mask_u8: np.ndarray, min_pixels_full: int, max_objects: int = 2):
     h, w = mask_u8.shape
-    g, comp_id, comp_sizes = find_connected_components(mask_u8, grid=192)
+    g, comp_id, comp_sizes = find_connected_components(mask_u8, grid=176)
     if len(comp_sizes) <= 1:
         return []
 
@@ -331,6 +333,70 @@ def detect_face_mask(ormbg_u8: np.ndarray, winning_cls: np.ndarray, f_probs: np.
     return cleaned
 
 
+def expand_bag_region(ormbg_u8: np.ndarray, f_probs: np.ndarray, winning_cls: np.ndarray) -> np.ndarray | None:
+    """
+    কোনো নতুন মডেল ছাড়াই ORMBG-র ভেতরে থাকা এবং Bag (class 8)-এর সাথে সংযুক্ত
+    পুরো ব্যাকপ্যাক (যেমন কমলা ট্রাভেল ব্যাগের উভয় পাশ) সম্পূর্ণভাবে সিলেক্ট করে।
+    """
+    bag_seed = ((winning_cls == 8) | (f_probs[8] >= 0.32)) & (ormbg_u8 >= 115)
+    seed_cnt = int(np.count_nonzero(bag_seed))
+    if seed_cnt < 100:
+        return None
+
+    # যে অংশ নিশ্চিতভাবে ব্যাগ হতে পারে (ORMBG ফোরগ্রাউন্ডে আছে এবং Face/Hair/Hat/Shirt/Neck/Pants নয়)
+    non_bag = (
+        (f_probs[1] >= 0.42)
+        | (f_probs[2] >= 0.42)
+        | (f_probs[3] >= 0.46)
+        | (f_probs[4] >= 0.46)
+        | (f_probs[6] >= 0.46)
+        | (f_probs[9] >= 0.42)
+        | (f_probs[16] >= 0.42)
+    )
+    bag_allowed = (ormbg_u8 >= 120) & (~non_bag) & ((f_probs[8] >= 0.12) | (f_probs[0] >= 0.25))
+    cand_u8 = np.where(bag_allowed | bag_seed, ormbg_u8, 0).astype(np.uint8)
+    cand_u8 = np.asarray(Image.fromarray(cand_u8, mode="L").filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3)), dtype=np.uint8)
+
+    # 128x128 গ্রিডে শুধু সেই কম্পোনেন্টগুলো রাখা যেগুলোতে Bag seed আছে
+    grid = 128
+    h, w = ormbg_u8.shape
+    small_cand = np.asarray(Image.fromarray(cand_u8, mode="L").resize((grid, grid), Image.Resampling.BILINEAR), dtype=np.uint8) >= 95
+    small_seed = np.asarray(Image.fromarray((bag_seed.astype(np.uint8) * 255), mode="L").resize((grid, grid), Image.Resampling.BILINEAR), dtype=np.uint8) >= 95
+
+    fg = small_cand.ravel().tolist()
+    sd = small_seed.ravel().tolist()
+    n = grid * grid
+    visited = [False] * n
+    keep = [0] * n
+
+    for start in range(n):
+        if not sd[start] or not fg[start] or visited[start]:
+            continue
+        q = deque([start])
+        visited[start] = True
+        while q:
+            idx = q.popleft()
+            keep[idx] = 255
+            x = idx % grid
+            if x > 0 and fg[idx - 1] and not visited[idx - 1]:
+                visited[idx - 1] = True
+                q.append(idx - 1)
+            if x < grid - 1 and fg[idx + 1] and not visited[idx + 1]:
+                visited[idx + 1] = True
+                q.append(idx + 1)
+            if idx >= grid and fg[idx - grid] and not visited[idx - grid]:
+                visited[idx - grid] = True
+                q.append(idx - grid)
+            if idx + grid < n and fg[idx + grid] and not visited[idx + grid]:
+                visited[idx + grid] = True
+                q.append(idx + grid)
+
+    keep_img = Image.fromarray(np.array(keep, dtype=np.uint8).reshape(grid, grid), mode="L")
+    keep_full = np.asarray(keep_img.resize((w, h), Image.Resampling.BILINEAR), dtype=np.uint8)
+    bag_u8 = np.where(keep_full >= 85, ormbg_u8, 0).astype(np.uint8)
+    return clean_part_mask(bag_u8, island_ratio=0.08, erode=False, close_size=3)
+
+
 def mask_u8_to_base64_rgba(mask_u8: np.ndarray) -> str:
     h, w = mask_u8.shape
     rgba = np.empty((h, w, 4), dtype=np.uint8)
@@ -377,7 +443,7 @@ def segment_parts(req: SegmentRequest):
         orig_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         subject_sess, fashn_sess = get_sessions()
         ormbg_u8 = run_subject_ormbg(subject_sess, orig_img)
-        f_probs = run_fashn_b4(fashn_sess, orig_img)
+        f_probs = run_fashn_b4_fast(fashn_sess, orig_img)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {e}")
 
@@ -385,7 +451,6 @@ def segment_parts(req: SegmentRequest):
     img_area = orig_w * orig_h
     ormbg_area = int(np.count_nonzero(ormbg_u8 >= 120))
 
-    # মানুষ আলাদা করা (সোফা বা ল্যাপটপ বাদ দিয়ে)
     fashn_person_prob = 1.0 - f_probs[0]
     person_soft_u8 = np.clip(((fashn_person_prob - 0.10) / 0.45) * 255.0, 0, 255).astype(np.uint8)
     person_u8 = np.minimum(ormbg_u8, person_soft_u8)
@@ -394,6 +459,10 @@ def segment_parts(req: SegmentRequest):
     face_mask_u8 = detect_face_mask(ormbg_u8, winning_cls, f_probs)
     if face_mask_u8 is not None:
         person_u8 = np.maximum(person_u8, face_mask_u8)
+
+    bag_expanded_u8 = expand_bag_region(ormbg_u8, f_probs, winning_cls)
+    if bag_expanded_u8 is not None:
+        person_u8 = np.maximum(person_u8, bag_expanded_u8)
 
     person_area = int(np.count_nonzero(person_u8 >= 120))
     has_person = person_area >= max(400, int(img_area * 0.015))
@@ -405,12 +474,13 @@ def segment_parts(req: SegmentRequest):
     else:
         main_subject_u8 = ormbg_u8
 
-    # মানুষের বাইরে থাকা সোফা, চেয়ার, ল্যাপটপ আলাদা করা (কর্নার শার্প রেখে)
     env_objects = []
     if has_person and ormbg_area > person_area:
         env_raw = np.where((ormbg_u8 >= 115) & (main_subject_u8 < 115), ormbg_u8, 0).astype(np.uint8)
         if face_mask_u8 is not None:
             env_raw = np.minimum(env_raw, (255 - face_mask_u8).astype(np.uint8))
+        if bag_expanded_u8 is not None:
+            env_raw = np.minimum(env_raw, (255 - bag_expanded_u8).astype(np.uint8))
         env_clean = Image.fromarray(env_raw, mode="L").filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
         env_u8 = np.asarray(env_clean, dtype=np.uint8)
         min_obj_px = max(600, int(img_area * 0.02))
@@ -445,7 +515,7 @@ def segment_parts(req: SegmentRequest):
         if float(np.mean(p_sum[win_mask])) < min_conf:
             return
 
-        part_u8 = np.clip(((p_sum - 0.15) / 0.65) * 255.0, 0, 255).astype(np.uint8)
+        part_u8 = np.clip(((p_sum - 0.14) / 0.66) * 255.0, 0, 255).astype(np.uint8)
         part_u8 = np.minimum(part_u8, subj_gate)
         if face_mask_u8 is not None and label in ("Hair", "Face"):
             part_u8 = np.minimum(part_u8, (255 - face_mask_u8).astype(np.uint8))
@@ -465,7 +535,7 @@ def segment_parts(req: SegmentRequest):
         parts.append({"label": "Object 2", "mask": mask_u8_to_base64_rgba(env_objects[1])})
 
     if has_person:
-        add_smart_part("Shirt / Top", [3], min_ratio=0.025, min_abs=350, min_conf=0.40, erode=False, close_size=5)
+        add_smart_part("Shirt / Top", [3], min_ratio=0.025, min_abs=350, min_conf=0.38, erode=False, close_size=5)
         if not (top_cnt > dress_cnt * 2.2 and dress_cnt < subj_area * 0.08):
             add_smart_part("Dress", [4], min_ratio=0.04, min_abs=500)
         add_smart_part("Pants", [6], min_ratio=0.025, min_abs=350, min_conf=0.52, close_size=5)
@@ -483,7 +553,12 @@ def segment_parts(req: SegmentRequest):
         add_smart_part("Neck / Body", [16], min_ratio=0.008, min_abs=140, island_ratio=0.12)
         add_smart_part("Hat", [9], min_ratio=0.010, min_abs=160, island_ratio=0.15)
         add_smart_part("Glasses", [11], min_ratio=0.004, min_abs=80, island_ratio=0.15)
-        add_smart_part("Bag", [8], min_ratio=0.010, min_abs=160, island_ratio=0.12)
+
+        if bag_expanded_u8 is not None and int(np.count_nonzero(bag_expanded_u8 >= 120)) >= 140:
+            parts.append({"label": "Bag", "mask": mask_u8_to_base64_rgba(bag_expanded_u8)})
+        else:
+            add_smart_part("Bag", [8], min_ratio=0.008, min_abs=140, min_conf=0.36, island_ratio=0.10, erode=False)
+
         add_smart_part("Scarf", [10], min_ratio=0.008, min_abs=140, island_ratio=0.12)
         add_smart_part("Belt", [7], min_ratio=0.004, min_abs=80, island_ratio=0.15)
         add_smart_part("Jewelry", [17], min_ratio=0.003, min_abs=60, island_ratio=0.15)
